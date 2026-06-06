@@ -1,0 +1,39 @@
+# Build outputs
+bin/
+obj/
+dist/
+publish/
+artifacts/
+TestResults/
+
+# Release assets
+releases/
+*.exe
+*.zip
+*.msi
+
+# Debug symbols
+*.pdb
+
+# User/local files
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# App local runtime/config files
+settings.json
+learning-state.json
