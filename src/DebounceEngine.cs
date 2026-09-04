@@ -3,9 +3,17 @@ using System.Collections.Generic;
 
 namespace KeyboardDebounce
 {
+    public enum DebounceMode
+    {
+        Normal = 0,
+        Game = 1
+    }
+
     public sealed class KeyEventSample
     {
         public int VirtualKeyCode { get; set; }
+        public uint ScanCode { get; set; }
+        public bool IsExtendedKey { get; set; }
         public bool IsKeyDown { get; set; }
         public long TimestampMs { get; set; }
     }
@@ -18,14 +26,57 @@ namespace KeyboardDebounce
         public long IntervalMs { get; set; }
         public int LearningAdjustmentMs { get; set; }
         public string LearningReason { get; set; }
+        public bool LearningStateChanged { get; set; }
+    }
+
+    internal readonly struct PhysicalKeyIdentity : IEquatable<PhysicalKeyIdentity>
+    {
+        public PhysicalKeyIdentity(int virtualKeyCode, uint scanCode, bool isExtendedKey)
+        {
+            VirtualKeyCode = virtualKeyCode;
+            ScanCode = scanCode;
+            IsExtendedKey = isExtendedKey;
+        }
+
+        public int VirtualKeyCode { get; }
+        public uint ScanCode { get; }
+        public bool IsExtendedKey { get; }
+
+        public bool Equals(PhysicalKeyIdentity other)
+        {
+            return VirtualKeyCode == other.VirtualKeyCode
+                && ScanCode == other.ScanCode
+                && IsExtendedKey == other.IsExtendedKey;
+        }
+
+        public override bool Equals(object obj)
+        {
+            return obj is PhysicalKeyIdentity && Equals((PhysicalKeyIdentity)obj);
+        }
+
+        public override int GetHashCode()
+        {
+            unchecked
+            {
+                int hash = VirtualKeyCode;
+                hash = (hash * 397) ^ (int)ScanCode;
+                hash = (hash * 397) ^ (IsExtendedKey ? 1 : 0);
+                return hash;
+            }
+        }
     }
 
     internal sealed class RuntimeKeyState
     {
+        public DebounceMode Mode;
+        public bool HasMode;
         public bool IsDown;
         public long FirstDownMs = -1;
+        public long FirstSuppressedDownMs = -1;
+        public long LastObservedDownMs = -1;
         public long LastAcceptedDownMs = -1;
-        public int ConsecutiveSuspectedAccepted;
+        public bool HasPhysicalKeyUpSinceLastDown;
+        public int ConsecutiveNearBoundarySuppressions;
         public int StableAcceptedCount;
     }
 
@@ -35,7 +86,7 @@ namespace KeyboardDebounce
         private const int MaxThresholdMs = 250;
         private readonly AppSettings _settings;
         private readonly LearningState _learning;
-        private readonly Dictionary<int, RuntimeKeyState> _runtime;
+        private readonly Dictionary<PhysicalKeyIdentity, RuntimeKeyState> _runtime;
 
         public DebounceEngine(AppSettings settings, LearningState learning)
         {
@@ -45,62 +96,145 @@ namespace KeyboardDebounce
             _settings.Normalize();
             _learning = learning;
             _learning.Normalize(_settings.DefaultThresholdMs);
-            _runtime = new Dictionary<int, RuntimeKeyState>();
+            _runtime = new Dictionary<PhysicalKeyIdentity, RuntimeKeyState>();
         }
 
         public DebounceDecision Process(KeyEventSample sample)
         {
+            return Process(sample, DebounceMode.Normal);
+        }
+
+        public DebounceDecision Process(KeyEventSample sample, DebounceMode mode)
+        {
             if (sample == null) throw new ArgumentNullException("sample");
+            if (mode != DebounceMode.Normal && mode != DebounceMode.Game)
+            {
+                throw new ArgumentOutOfRangeException("mode");
+            }
 
             if (IsIgnored(sample.VirtualKeyCode))
             {
-                return NewDecision(false, "ignored", 0, 0, 0, "");
+                return NewDecision(false, "ignored", 0, 0, 0, "", false);
             }
 
-            KeyLearningState learning = GetLearningState(sample.VirtualKeyCode);
-            RuntimeKeyState runtime = GetRuntimeState(sample.VirtualKeyCode);
-            int threshold = GetEffectiveThreshold(learning);
+            bool freezeLearning = mode == DebounceMode.Game;
+            KeyLearningState learning = freezeLearning
+                ? FindLearningState(sample.VirtualKeyCode)
+                : GetLearningState(sample.VirtualKeyCode);
+            PhysicalKeyIdentity identity = GetPhysicalKeyIdentity(sample);
+            RuntimeKeyState runtime = GetRuntimeState(identity, mode);
+            int threshold = GetEffectiveThreshold(learning, mode);
+            int longHoldBypassMs = mode == DebounceMode.Game
+                ? _settings.GameModeLongHoldBypassMs
+                : _settings.LongHoldBypassMs;
 
             if (!sample.IsKeyDown)
             {
-                runtime.IsDown = false;
-                runtime.FirstDownMs = -1;
-                learning.LastSeenUtc = DateTime.UtcNow;
-                return NewDecision(false, "key-up", threshold, 0, 0, "");
+                CompleteRuntimeKeyUpWithoutLearning(identity);
+                if (!freezeLearning)
+                {
+                    learning.LastSeenUtc = DateTime.UtcNow;
+                }
+                return NewDecision(
+                    false,
+                    "key-up",
+                    threshold,
+                    0,
+                    0,
+                    "",
+                    !freezeLearning);
             }
 
-            long interval = runtime.LastAcceptedDownMs >= 0
-                ? sample.TimestampMs - runtime.LastAcceptedDownMs
-                : Int64.MaxValue;
-            if (interval < 0) interval = Int64.MaxValue;
+            long observedInterval = GetInterval(sample.TimestampMs, runtime.LastObservedDownMs);
+            long acceptedInterval = GetInterval(sample.TimestampMs, runtime.LastAcceptedDownMs);
+            bool releaseSeparated = runtime.HasPhysicalKeyUpSinceLastDown;
+            runtime.HasPhysicalKeyUpSinceLastDown = false;
+            runtime.LastObservedDownMs = sample.TimestampMs;
 
-            bool heldLongEnough = runtime.IsDown &&
+            bool acceptedHoldLongEnough = runtime.IsDown &&
                 runtime.FirstDownMs >= 0 &&
-                sample.TimestampMs - runtime.FirstDownMs >= _settings.LongHoldBypassMs;
+                GetInterval(sample.TimestampMs, runtime.FirstDownMs) >= longHoldBypassMs;
+            bool suppressedHoldLongEnough = !runtime.IsDown &&
+                runtime.FirstSuppressedDownMs >= 0 &&
+                GetInterval(sample.TimestampMs, runtime.FirstSuppressedDownMs) >= longHoldBypassMs;
+            bool heldLongEnough = acceptedHoldLongEnough || suppressedHoldLongEnough;
 
-            if (!heldLongEnough && interval <= threshold)
+            if (!heldLongEnough && observedInterval <= threshold)
             {
-                learning.SuppressedCount++;
-                learning.LastIntervalMs = interval;
-                learning.LastSeenUtc = DateTime.UtcNow;
-                runtime.ConsecutiveSuspectedAccepted = 0;
+                if (!runtime.IsDown && runtime.FirstSuppressedDownMs < 0)
+                {
+                    runtime.FirstSuppressedDownMs = sample.TimestampMs;
+                }
                 runtime.StableAcceptedCount = 0;
-                int adjustment = LearnFromSuppression(learning, interval, threshold);
-                return NewDecision(true, "short-repeat", threshold, interval, adjustment, learning.LastAdjustmentReason);
+
+                int adjustment = 0;
+                string learningReason = "";
+                if (!freezeLearning)
+                {
+                    learning.SuppressedCount++;
+                    learning.LastIntervalMs = observedInterval;
+                    learning.LastSeenUtc = DateTime.UtcNow;
+                    adjustment = LearnFromSuppression(
+                        learning,
+                        runtime,
+                        observedInterval,
+                        threshold,
+                        releaseSeparated);
+                    learningReason = adjustment == 0 ? "" : learning.LastAdjustmentReason;
+                }
+
+                return NewDecision(
+                    true,
+                    "short-repeat",
+                    threshold,
+                    observedInterval,
+                    adjustment,
+                    learningReason,
+                    !freezeLearning);
             }
 
             if (!runtime.IsDown)
             {
-                runtime.FirstDownMs = sample.TimestampMs;
+                runtime.FirstDownMs = suppressedHoldLongEnough
+                    ? runtime.FirstSuppressedDownMs
+                    : sample.TimestampMs;
             }
 
             runtime.IsDown = true;
+            runtime.FirstSuppressedDownMs = -1;
             runtime.LastAcceptedDownMs = sample.TimestampMs;
-            learning.AcceptedCount++;
-            learning.LastIntervalMs = interval == Int64.MaxValue ? 0 : interval;
-            learning.LastSeenUtc = DateTime.UtcNow;
-            int acceptedAdjustment = LearnFromAcceptance(learning, runtime, interval, threshold, heldLongEnough);
-            return NewDecision(false, heldLongEnough ? "long-hold" : "accepted", threshold, interval, acceptedAdjustment, learning.LastAdjustmentReason);
+
+            int acceptedAdjustment = 0;
+            string acceptedLearningReason = "";
+            if (freezeLearning)
+            {
+                runtime.ConsecutiveNearBoundarySuppressions = 0;
+                runtime.StableAcceptedCount = 0;
+            }
+            else
+            {
+                learning.AcceptedCount++;
+                learning.LastIntervalMs = observedInterval == Int64.MaxValue ? 0 : observedInterval;
+                learning.LastSeenUtc = DateTime.UtcNow;
+                acceptedAdjustment = LearnFromAcceptance(
+                    learning,
+                    runtime,
+                    acceptedInterval,
+                    threshold,
+                    heldLongEnough);
+                acceptedLearningReason = acceptedAdjustment == 0
+                    ? ""
+                    : learning.LastAdjustmentReason;
+            }
+
+            return NewDecision(
+                false,
+                heldLongEnough ? "long-hold" : "accepted",
+                threshold,
+                observedInterval,
+                acceptedAdjustment,
+                acceptedLearningReason,
+                !freezeLearning);
         }
 
         public KeyLearningState GetLearningState(int virtualKeyCode)
@@ -113,6 +247,16 @@ namespace KeyboardDebounce
             }
 
             learning.Normalize(_settings.DefaultThresholdMs);
+            return learning;
+        }
+
+        private KeyLearningState FindLearningState(int virtualKeyCode)
+        {
+            KeyLearningState learning;
+            if (!_learning.Keys.TryGetValue(virtualKeyCode, out learning))
+            {
+                return null;
+            }
             return learning;
         }
 
@@ -136,9 +280,77 @@ namespace KeyboardDebounce
             _runtime.Clear();
         }
 
+        public void ResetRuntimeState()
+        {
+            _runtime.Clear();
+        }
+
+        internal void ResetRuntimeStateExcept(ICollection<PhysicalKeyIdentity> preservedKeys)
+        {
+            if (preservedKeys == null || preservedKeys.Count == 0)
+            {
+                ResetRuntimeState();
+                return;
+            }
+
+            var keysToRemove = new List<PhysicalKeyIdentity>();
+            foreach (PhysicalKeyIdentity identity in _runtime.Keys)
+            {
+                if (!preservedKeys.Contains(identity))
+                {
+                    keysToRemove.Add(identity);
+                }
+                else
+                {
+                    RuntimeKeyState runtime = _runtime[identity];
+                    runtime.ConsecutiveNearBoundarySuppressions = 0;
+                    runtime.StableAcceptedCount = 0;
+                }
+            }
+
+            foreach (PhysicalKeyIdentity identity in keysToRemove)
+            {
+                _runtime.Remove(identity);
+            }
+        }
+
+        internal void CompleteRuntimeKeyUpWithoutLearning(PhysicalKeyIdentity identity)
+        {
+            RuntimeKeyState runtime;
+            if (!_runtime.TryGetValue(identity, out runtime)) return;
+
+            runtime.IsDown = false;
+            runtime.FirstDownMs = -1;
+            runtime.FirstSuppressedDownMs = -1;
+            runtime.HasPhysicalKeyUpSinceLastDown = true;
+        }
+
+        private void ResetRuntimeForIgnoredKey(int virtualKeyCode)
+        {
+            foreach (var pair in _runtime)
+            {
+                if (pair.Key.VirtualKeyCode != virtualKeyCode) continue;
+
+                RuntimeKeyState runtime = pair.Value;
+                runtime.IsDown = false;
+                runtime.FirstDownMs = -1;
+                runtime.FirstSuppressedDownMs = -1;
+                runtime.LastAcceptedDownMs = -1;
+                runtime.HasPhysicalKeyUpSinceLastDown = false;
+                runtime.ConsecutiveNearBoundarySuppressions = 0;
+                runtime.StableAcceptedCount = 0;
+            }
+        }
+
         public bool IsIgnored(int virtualKeyCode)
         {
             return _settings.IgnoredKeys != null && _settings.IgnoredKeys.Contains(virtualKeyCode);
+        }
+
+        public bool IsGameModeFilteredKey(int virtualKeyCode)
+        {
+            return _settings.GameModeFilteredKeys != null
+                && _settings.GameModeFilteredKeys.Contains(virtualKeyCode);
         }
 
         public void IgnoreKey(int virtualKeyCode)
@@ -155,7 +367,7 @@ namespace KeyboardDebounce
             }
 
             _learning.Keys.Remove(virtualKeyCode);
-            _runtime.Remove(virtualKeyCode);
+            ResetRuntimeForIgnoredKey(virtualKeyCode);
         }
 
         public void UnignoreKey(int virtualKeyCode)
@@ -172,24 +384,76 @@ namespace KeyboardDebounce
             }
         }
 
-        private RuntimeKeyState GetRuntimeState(int virtualKeyCode)
+        private RuntimeKeyState GetRuntimeState(
+            PhysicalKeyIdentity identity,
+            DebounceMode mode)
         {
             RuntimeKeyState state;
-            if (!_runtime.TryGetValue(virtualKeyCode, out state))
+            if (!_runtime.TryGetValue(identity, out state))
             {
                 state = new RuntimeKeyState();
-                _runtime[virtualKeyCode] = state;
+                _runtime[identity] = state;
+            }
+            if (!state.HasMode || state.Mode != mode)
+            {
+                ResetRuntimeForMode(state, mode);
             }
             return state;
         }
 
-        private int GetEffectiveThreshold(KeyLearningState learning)
+        private int GetEffectiveThreshold(
+            KeyLearningState learning,
+            DebounceMode mode)
         {
-            int threshold = (int)Math.Round(learning.ThresholdMs * _settings.GlobalSensitivity);
-            return Clamp(threshold, MinThresholdMs, MaxThresholdMs);
+            int learnedThreshold = learning == null || learning.ThresholdMs == 0
+                ? _settings.DefaultThresholdMs
+                : learning.ThresholdMs;
+            learnedThreshold = Clamp(learnedThreshold, MinThresholdMs, MaxThresholdMs);
+            int threshold = (int)Math.Round(learnedThreshold * _settings.GlobalSensitivity);
+            threshold = Clamp(threshold, MinThresholdMs, MaxThresholdMs);
+            if (mode == DebounceMode.Game)
+            {
+                int gameThreshold = Clamp(
+                    _settings.GameModeThresholdMs,
+                    MinThresholdMs,
+                    MaxThresholdMs);
+                threshold = Math.Min(threshold, gameThreshold);
+            }
+            return threshold;
         }
 
-        private static DebounceDecision NewDecision(bool suppress, string reason, int threshold, long interval, int adjustment, string learningReason)
+        private static PhysicalKeyIdentity GetPhysicalKeyIdentity(KeyEventSample sample)
+        {
+            return new PhysicalKeyIdentity(
+                sample.VirtualKeyCode,
+                sample.ScanCode,
+                sample.IsExtendedKey);
+        }
+
+        private static void ResetRuntimeForMode(
+            RuntimeKeyState runtime,
+            DebounceMode mode)
+        {
+            runtime.Mode = mode;
+            runtime.HasMode = true;
+            runtime.IsDown = false;
+            runtime.FirstDownMs = -1;
+            runtime.FirstSuppressedDownMs = -1;
+            runtime.LastObservedDownMs = -1;
+            runtime.LastAcceptedDownMs = -1;
+            runtime.HasPhysicalKeyUpSinceLastDown = false;
+            runtime.ConsecutiveNearBoundarySuppressions = 0;
+            runtime.StableAcceptedCount = 0;
+        }
+
+        private static DebounceDecision NewDecision(
+            bool suppress,
+            string reason,
+            int threshold,
+            long interval,
+            int adjustment,
+            string learningReason,
+            bool learningStateChanged)
         {
             return new DebounceDecision
             {
@@ -198,70 +462,91 @@ namespace KeyboardDebounce
                 EffectiveThresholdMs = threshold,
                 IntervalMs = interval == Int64.MaxValue ? 0 : interval,
                 LearningAdjustmentMs = adjustment,
-                LearningReason = learningReason ?? ""
+                LearningReason = learningReason ?? "",
+                LearningStateChanged = learningStateChanged
             };
         }
 
-        private static int LearnFromSuppression(KeyLearningState learning, long interval, int threshold)
+        private int LearnFromSuppression(
+            KeyLearningState learning,
+            RuntimeKeyState runtime,
+            long interval,
+            int threshold,
+            bool releaseSeparated)
         {
-            if (interval <= 0)
+            if (!releaseSeparated || interval <= 0 || interval < threshold - 5)
             {
-                RecordAdjustment(learning, 0, "");
+                runtime.ConsecutiveNearBoundarySuppressions = 0;
                 return 0;
             }
 
-            int delta = 0;
-            string reason = "";
-            if (interval >= threshold - 5)
+            runtime.ConsecutiveNearBoundarySuppressions++;
+            if (runtime.ConsecutiveNearBoundarySuppressions < 2)
             {
-                delta = 8;
-                reason = "suppressed-near-boundary";
+                return 0;
             }
-            else if (interval >= threshold / 2)
-            {
-                delta = 3;
-                reason = "suppressed-mid-window";
-            }
+            runtime.ConsecutiveNearBoundarySuppressions = 0;
 
-            return ApplyAdjustment(learning, delta, reason);
+            int measuredThreshold = (int)Math.Ceiling(
+                (interval + 5.0) / _settings.GlobalSensitivity);
+            int automaticUpperBound = Math.Min(
+                MaxThresholdMs,
+                _settings.DefaultThresholdMs + 40);
+            int targetThreshold = Math.Min(
+                measuredThreshold,
+                automaticUpperBound);
+            if (targetThreshold <= learning.ThresholdMs)
+            {
+                return 0;
+            }
+            return ApplyAdjustment(
+                learning,
+                targetThreshold - learning.ThresholdMs,
+                "suppressed-near-boundary");
         }
 
-        private static int LearnFromAcceptance(KeyLearningState learning, RuntimeKeyState runtime, long interval, int threshold, bool heldLongEnough)
+        private int LearnFromAcceptance(
+            KeyLearningState learning,
+            RuntimeKeyState runtime,
+            long interval,
+            int threshold,
+            bool heldLongEnough)
         {
             if (heldLongEnough || interval <= 0 || interval == Int64.MaxValue)
             {
-                runtime.ConsecutiveSuspectedAccepted = 0;
-                RecordAdjustment(learning, 0, "");
-                return 0;
-            }
-
-            bool suspectedBounce = interval > threshold && interval <= Math.Min(MaxThresholdMs, threshold + 80);
-            if (suspectedBounce)
-            {
-                runtime.ConsecutiveSuspectedAccepted++;
+                runtime.ConsecutiveNearBoundarySuppressions = 0;
                 runtime.StableAcceptedCount = 0;
-                if (runtime.ConsecutiveSuspectedAccepted >= 2)
-                {
-                    runtime.ConsecutiveSuspectedAccepted = 0;
-                    return ApplyAdjustment(learning, 5, "accepted-suspected-bounce");
-                }
-
-                RecordAdjustment(learning, 0, "");
                 return 0;
             }
 
-            runtime.ConsecutiveSuspectedAccepted = 0;
-            if (interval > threshold * 4 && learning.SuppressedCount == 0)
+            runtime.ConsecutiveNearBoundarySuppressions = 0;
+            if (learning.ThresholdMs <= _settings.DefaultThresholdMs)
+            {
+                runtime.StableAcceptedCount = 0;
+                return 0;
+            }
+
+            long stableIntervalMs = Math.Max(300L, threshold * 2L);
+            if (interval >= stableIntervalMs)
             {
                 runtime.StableAcceptedCount++;
-                if (runtime.StableAcceptedCount >= 25)
+                if (runtime.StableAcceptedCount >= 12)
                 {
                     runtime.StableAcceptedCount = 0;
-                    return ApplyAdjustment(learning, -1, "stable-decay");
+                    int targetThreshold = Math.Max(
+                        _settings.DefaultThresholdMs,
+                        learning.ThresholdMs - 5);
+                    return ApplyAdjustment(
+                        learning,
+                        targetThreshold - learning.ThresholdMs,
+                        "stable-decay");
                 }
             }
+            else
+            {
+                runtime.StableAcceptedCount = 0;
+            }
 
-            RecordAdjustment(learning, 0, "");
             return 0;
         }
 
@@ -269,7 +554,6 @@ namespace KeyboardDebounce
         {
             if (delta == 0)
             {
-                RecordAdjustment(learning, 0, "");
                 return 0;
             }
 
@@ -277,18 +561,38 @@ namespace KeyboardDebounce
             int after = Clamp(before + delta, MinThresholdMs, MaxThresholdMs);
             int actualDelta = after - before;
             learning.ThresholdMs = after;
-            RecordAdjustment(learning, actualDelta, actualDelta == 0 ? "" : reason);
+            if (actualDelta != 0)
+            {
+                RecordAdjustment(learning, actualDelta, reason);
+            }
             return actualDelta;
         }
 
         private static void RecordAdjustment(KeyLearningState learning, int delta, string reason)
         {
+            if (delta == 0) return;
             learning.LastAdjustmentMs = delta;
             learning.LastAdjustmentReason = reason ?? "";
-            if (delta != 0)
+            learning.LastAdjustedUtc = DateTime.UtcNow;
+        }
+
+        private static long GetInterval(long timestampMs, long previousTimestampMs)
+        {
+            if (previousTimestampMs < 0)
             {
-                learning.LastAdjustedUtc = DateTime.UtcNow;
+                return Int64.MaxValue;
             }
+            if (timestampMs >= previousTimestampMs)
+            {
+                return timestampMs - previousTimestampMs;
+            }
+            if (timestampMs >= 0
+                && timestampMs <= UInt32.MaxValue
+                && previousTimestampMs <= UInt32.MaxValue)
+            {
+                return unchecked((uint)timestampMs - (uint)previousTimestampMs);
+            }
+            return Int64.MaxValue;
         }
 
         private static int Clamp(int value, int min, int max)

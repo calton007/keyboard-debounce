@@ -30,7 +30,7 @@ namespace KeyboardDebounce
                 }
             }
 
-            return SystemIcons.Shield;
+            return (Icon)SystemIcons.Shield.Clone();
         }
 
         private static Icon TryExtractAssociatedIcon(string exePath)

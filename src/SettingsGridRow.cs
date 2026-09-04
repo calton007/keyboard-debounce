@@ -8,6 +8,7 @@ namespace KeyboardDebounce
         public int Vk { get; set; }
         public string KeyName { get; set; }
         public bool Ignored { get; set; }
+        public bool GameFiltered { get; set; }
         public bool HasLearning { get; set; }
         public int ThresholdMs { get; set; }
         public long AcceptedCount { get; set; }
@@ -61,6 +62,8 @@ namespace KeyboardDebounce
                     return CompareNullableNumber(left.HasLearning, left.SuppressedCount, right.HasLearning, right.SuppressedCount);
                 case "Ignored":
                     return left.Ignored.CompareTo(right.Ignored);
+                case "GameFiltered":
+                    return left.GameFiltered.CompareTo(right.GameFiltered);
                 case "LastSeen":
                     return String.Compare(left.LastSeen, right.LastSeen, StringComparison.Ordinal);
                 case "KeyName":

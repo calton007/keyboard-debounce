@@ -119,22 +119,39 @@ namespace KeyboardDebounce.Tests
         }
 
         [Fact]
-        public void SuppressionNearBoundaryRecordsLearning()
+        public void TwoReleaseSeparatedNearBoundarySuppressionsLearnToMeasuredTarget()
         {
             var settings = new AppSettings { DefaultThresholdMs = 90 };
             var engine = NewEngine(settings, out var learning);
 
             engine.Process(Down(65, 1000));
-            DebounceDecision decision = engine.Process(Down(65, 1088));
+            engine.Process(Up(65, 1010));
+            DebounceDecision first = engine.Process(Down(65, 1088));
+            engine.Process(Up(65, 1098));
+            DebounceDecision second = engine.Process(Down(65, 1176));
 
-            Assert.True(decision.Suppress);
-            Assert.True(decision.LearningAdjustmentMs > 0);
-            Assert.True(learning.Keys[65].ThresholdMs > 90);
+            Assert.True(first.Suppress);
+            Assert.Equal(0, first.LearningAdjustmentMs);
+            Assert.True(second.Suppress);
+            Assert.Equal(3, second.LearningAdjustmentMs);
+            Assert.Equal(93, learning.Keys[65].ThresholdMs);
             Assert.Equal("suppressed-near-boundary", learning.Keys[65].LastAdjustmentReason);
+
+            long timestampMs = 1176;
+            for (int index = 0; index < 4; index++)
+            {
+                engine.Process(Up(65, timestampMs + 10));
+                timestampMs += 88;
+                DebounceDecision sameRhythm = engine.Process(Down(65, timestampMs));
+                Assert.True(sameRhythm.Suppress);
+                Assert.Equal(0, sameRhythm.LearningAdjustmentMs);
+            }
+
+            Assert.Equal(93, learning.Keys[65].ThresholdMs);
         }
 
         [Fact]
-        public void AcceptedSuspectedBounceLearnsUpward()
+        public void AcceptedEventsNeverLearnUpward()
         {
             var settings = new AppSettings { DefaultThresholdMs = 45, LongHoldBypassMs = 500 };
             var engine = NewEngine(settings, out var learning);
@@ -147,25 +164,28 @@ namespace KeyboardDebounce.Tests
 
             Assert.False(first.Suppress);
             Assert.False(second.Suppress);
-            Assert.True(second.LearningAdjustmentMs > 0);
-            Assert.Equal("accepted-suspected-bounce", learning.Keys[65].LastAdjustmentReason);
+            Assert.Equal(0, first.LearningAdjustmentMs);
+            Assert.Equal(0, second.LearningAdjustmentMs);
+            Assert.Equal(45, learning.Keys[65].ThresholdMs);
         }
 
         [Fact]
         public void StableInputLearnsDownward()
         {
             var settings = new AppSettings { DefaultThresholdMs = 120, LongHoldBypassMs = 500 };
-            var engine = NewEngine(settings, out var learning);
+            var learning = new LearningState();
+            learning.Keys[65] = new KeyLearningState { ThresholdMs = 140 };
+            var engine = new DebounceEngine(settings, learning);
             long ms = 1000;
 
-            for (int i = 0; i < 26; i++)
+            for (int i = 0; i < 13; i++)
             {
                 engine.Process(Down(65, ms));
                 engine.Process(Up(65, ms + 10));
                 ms += 600;
             }
 
-            Assert.True(learning.Keys[65].ThresholdMs < 120);
+            Assert.Equal(135, learning.Keys[65].ThresholdMs);
             Assert.Equal("stable-decay", learning.Keys[65].LastAdjustmentReason);
         }
 
@@ -265,8 +285,12 @@ namespace KeyboardDebounce.Tests
                 Assert.False(loaded.Settings.SilentRun);
                 Assert.Contains(8, loaded.Settings.IgnoredKeys);
                 Assert.True(loaded.Learning.Keys.ContainsKey(65));
-                Assert.Equal(130, loaded.Learning.Keys[65].ThresholdMs);
-                Assert.Equal("legacy", loaded.Learning.Keys[65].LastAdjustmentReason);
+                Assert.Equal(2, loaded.Learning.SchemaVersion);
+                Assert.Equal(90, loaded.Learning.Keys[65].ThresholdMs);
+                Assert.Equal(-40, loaded.Learning.Keys[65].LastAdjustmentMs);
+                Assert.Equal(
+                    "schema-v2-high-threshold-reset",
+                    loaded.Learning.Keys[65].LastAdjustmentReason);
             }
             finally
             {

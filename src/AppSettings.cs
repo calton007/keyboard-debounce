@@ -9,6 +9,17 @@ namespace KeyboardDebounce
     {
         public AppSettings()
         {
+            SetDefaults();
+        }
+
+        [OnDeserializing]
+        private void OnDeserializing(StreamingContext context)
+        {
+            SetDefaults();
+        }
+
+        private void SetDefaults()
+        {
             Enabled = true;
             StartWithWindows = false;
             SilentRun = false;
@@ -16,8 +27,13 @@ namespace KeyboardDebounce
             DefaultThresholdMs = 90;
             LongHoldBypassMs = 500;
             StartupDelayMs = 3000;
-            PauseHotkey = "Ctrl+Alt+F12";
+            PauseHotkey = "Ctrl+Alt+F11";
             IgnoredKeys = new List<int>();
+            ProcessGameModeEnabled = false;
+            GameProcesses = new List<string>();
+            GameModeThresholdMs = 45;
+            GameModeLongHoldBypassMs = 250;
+            GameModeFilteredKeys = new List<int>();
         }
 
         [DataMember(Order = 1)]
@@ -47,6 +63,21 @@ namespace KeyboardDebounce
         [DataMember(Order = 9)]
         public List<int> IgnoredKeys { get; set; }
 
+        [DataMember(Order = 10)]
+        public bool ProcessGameModeEnabled { get; set; }
+
+        [DataMember(Order = 11)]
+        public List<string> GameProcesses { get; set; }
+
+        [DataMember(Order = 12)]
+        public int GameModeThresholdMs { get; set; }
+
+        [DataMember(Order = 13)]
+        public int GameModeLongHoldBypassMs { get; set; }
+
+        [DataMember(Order = 14)]
+        public List<int> GameModeFilteredKeys { get; set; }
+
         public void Normalize()
         {
             if (GlobalSensitivity < 0.5) GlobalSensitivity = 0.5;
@@ -57,20 +88,74 @@ namespace KeyboardDebounce
             if (LongHoldBypassMs > 1000) LongHoldBypassMs = 1000;
             if (StartupDelayMs < 0) StartupDelayMs = 0;
             if (StartupDelayMs > 30000) StartupDelayMs = 30000;
-            if (String.IsNullOrWhiteSpace(PauseHotkey)) PauseHotkey = "Ctrl+Alt+F12";
-            if (IgnoredKeys == null) IgnoredKeys = new List<int>();
+            if (String.IsNullOrWhiteSpace(PauseHotkey)
+                || String.Equals(PauseHotkey.Trim(), "Ctrl+Alt+F12", StringComparison.OrdinalIgnoreCase))
+            {
+                PauseHotkey = "Ctrl+Alt+F11";
+            }
+            IgnoredKeys = NormalizeVirtualKeyList(IgnoredKeys);
+            if (GameModeThresholdMs < 20) GameModeThresholdMs = 20;
+            if (GameModeThresholdMs > 250) GameModeThresholdMs = 250;
+            if (GameModeLongHoldBypassMs < 50) GameModeLongHoldBypassMs = 50;
+            if (GameModeLongHoldBypassMs > 1000) GameModeLongHoldBypassMs = 1000;
+            NormalizeGameProcesses();
+            GameModeFilteredKeys = NormalizeVirtualKeyList(GameModeFilteredKeys);
+        }
+
+        private void NormalizeGameProcesses()
+        {
+            var normalizedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (GameProcesses != null)
+            {
+                foreach (string value in GameProcesses)
+                {
+                    string normalized = GameProcessDetector.NormalizeProcessName(value);
+                    if (!String.IsNullOrEmpty(normalized))
+                    {
+                        normalizedNames.Add(normalized);
+                    }
+                }
+            }
+
+            GameProcesses = new List<string>(normalizedNames);
+            GameProcesses.Sort(StringComparer.OrdinalIgnoreCase);
+        }
+
+        private static List<int> NormalizeVirtualKeyList(List<int> keys)
+        {
+            var normalizedKeys = new HashSet<int>();
+            if (keys != null)
+            {
+                foreach (int virtualKeyCode in keys)
+                {
+                    if (virtualKeyCode > 0 && virtualKeyCode <= 0xFF)
+                    {
+                        normalizedKeys.Add(virtualKeyCode);
+                    }
+                }
+            }
+
+            var result = new List<int>(normalizedKeys);
+            result.Sort();
+            return result;
         }
     }
 
     [DataContract]
     public sealed class LearningState
     {
+        internal const int CurrentSchemaVersion = 2;
+
         public LearningState()
         {
+            SchemaVersion = CurrentSchemaVersion;
             Keys = new Dictionary<int, KeyLearningState>();
         }
 
         [DataMember(Order = 1)]
+        public int SchemaVersion { get; set; }
+
+        [DataMember(Order = 2)]
         public Dictionary<int, KeyLearningState> Keys { get; set; }
 
         public void Normalize(int fallbackThreshold)
@@ -120,9 +205,9 @@ namespace KeyboardDebounce
 
         public void Normalize(int fallbackThreshold)
         {
+            if (ThresholdMs == 0) ThresholdMs = fallbackThreshold;
             if (ThresholdMs < 20) ThresholdMs = 20;
             if (ThresholdMs > 250) ThresholdMs = 250;
-            if (ThresholdMs == 0) ThresholdMs = fallbackThreshold;
             if (LastAdjustmentReason == null) LastAdjustmentReason = "";
             LastSeenUtc = NormalizeStoredUtc(LastSeenUtc);
             LastAdjustedUtc = NormalizeStoredUtc(LastAdjustedUtc);
