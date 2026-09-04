@@ -6,7 +6,7 @@ $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $assets = Join-Path $root 'assets'
 New-Item -ItemType Directory -Path $assets -Force | Out-Null
 
-$pngPath = Join-Path $assets 'keyboard-debounce-256.png'
+$pngPath = Join-Path $assets 'icon-source-256.png'
 $icoPath = Join-Path $assets 'keyboard-debounce.ico'
 $sizes = @(16, 24, 32, 48, 64, 128, 256)
 
