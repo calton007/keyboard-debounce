@@ -1,6 +1,9 @@
 # Build outputs
 bin/
 obj/
+node_modules/
+src-tauri/target/
+src-tauri/gen/
 dist/
 publish/
 artifacts/

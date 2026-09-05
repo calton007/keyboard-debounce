@@ -11,11 +11,29 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up .NET 8
-        uses: actions/setup-dotnet@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
         with:
-          dotnet-version: 8.0.x
+          node-version: 22
+          cache: npm
 
-      - name: Run verification
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Verify and package Windows x64
         shell: pwsh
-        run: .\scripts\verify.ps1
+        run: .\scripts\publish.ps1
+
+      - name: Upload verified release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: KeyboardDebounce-windows-x64
+          path: releases/KeyboardDebounce-*
+          if-no-files-found: error

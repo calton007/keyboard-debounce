@@ -1,61 +1,20 @@
 [CmdletBinding()]
 param()
-
 $ErrorActionPreference = 'Stop'
-
-$root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$project = Join-Path $root 'KeyboardDebounce.csproj'
-$testProject = Join-Path $root 'tests\KeyboardDebounce.Tests\KeyboardDebounce.Tests.csproj'
-$nugetConfig = Join-Path $root 'NuGet.Config'
-$publishContractTests = Join-Path $root 'tests\PublishScript.Tests.ps1'
-
-function Invoke-DotNet {
-    & dotnet @args
-    $exitCode = $LASTEXITCODE
-    if ($exitCode -ne 0) {
-        throw "dotnet $($args -join ' ') failed with exit code $exitCode."
-    }
+$repositoryRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'toolchain.ps1')
+Initialize-Toolchain
+Push-Location $repositoryRoot
+try {
+    Invoke-Checked 'npm.cmd' @('ci', '--no-audit', '--no-fund')
+    Invoke-Checked 'cargo.exe' @('fmt', '--manifest-path', 'src-tauri/Cargo.toml', '--check')
+    Invoke-Checked 'cargo.exe' @('clippy', '--manifest-path', 'src-tauri/Cargo.toml', '--locked', '--all-targets', '--', '-D', 'warnings')
+    Invoke-Checked 'cargo.exe' @('test', '--manifest-path', 'src-tauri/Cargo.toml', '--locked')
+    Invoke-Checked 'npm.cmd' @('run', 'typecheck')
+    Invoke-Checked 'npm.cmd' @('test')
+    Invoke-Checked 'npm.cmd' @('run', 'build')
+    & (Join-Path $repositoryRoot 'tests\PublishScript.Tests.ps1')
+    if (-not $?) { throw '发布契约测试失败' }
+    Write-Host 'Verification completed successfully.'
 }
-
-function Assert-StaticDependencyContracts {
-    param(
-        [string] $TestProjectPath,
-        [string[]] $ExcludedTestFiles
-    )
-
-    $testDirectory = Split-Path -Parent $TestProjectPath
-    $forbiddenPatterns = @(
-        'Microsoft\\.UI\\.Xaml',
-        'KeyboardDebounce\\.WinUI'
-    )
-
-    foreach ($file in Get-ChildItem -Path $testDirectory -Filter '*.cs' -File) {
-        if ($ExcludedTestFiles -contains $file.Name) {
-            continue
-        }
-
-        $source = Get-Content -Raw -LiteralPath $file.FullName
-        foreach ($pattern in $forbiddenPatterns) {
-            if ($source -match $pattern) {
-                throw "Forbidden test contract detected in $($file.Name): $pattern"
-            }
-        }
-    }
-}
-
-Invoke-DotNet restore $project --configfile $nugetConfig
-Invoke-DotNet restore $testProject --configfile $nugetConfig
-Invoke-DotNet build $project -c Release --no-restore
-Assert-StaticDependencyContracts -TestProjectPath $testProject -ExcludedTestFiles @(
-    'DpiTestBootstrap.cs',
-    'SettingsFormSmokeTests.cs',
-    'SettingsFormUiTests.cs'
-)
-Invoke-DotNet test $testProject -c Release --no-restore
-
-& $publishContractTests
-if (-not $?) {
-    throw "Publish script contract tests failed: $publishContractTests"
-}
-
-Write-Host 'Verification completed successfully.'
+finally { Pop-Location }

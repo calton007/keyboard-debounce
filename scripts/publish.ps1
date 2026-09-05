@@ -7,9 +7,7 @@ $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $runtime = 'win-x64'
-$project = Join-Path $root 'KeyboardDebounce.csproj'
-$testProject = Join-Path $root 'tests\KeyboardDebounce.Tests\KeyboardDebounce.Tests.csproj'
-$nugetConfig = Join-Path $root 'NuGet.Config'
+$project = Join-Path $root 'src-tauri\Cargo.toml'
 $dist = Join-Path $root 'dist'
 $stagingParent = Join-Path $dist 'release-staging'
 $releaseDir = Join-Path $root 'releases'
@@ -17,26 +15,19 @@ $releaseDir = Join-Path $root 'releases'
 function Get-ProjectVersion {
     param([string] $ProjectPath)
 
-    $projectXml = [xml](Get-Content -Raw -LiteralPath $ProjectPath)
-    $versionNodes = @($projectXml.SelectNodes('/Project/PropertyGroup/Version'))
+    $source = Get-Content -Raw -LiteralPath $ProjectPath
+    $packageSection = [regex]::Match($source, '(?ms)^\[package\]\s*(.*?)(?=^\[|\z)').Groups[1].Value
+    $versionNodes = [regex]::Matches($packageSection, '(?m)^version\s*=\s*"([^"]+)"\s*$')
     if ($versionNodes.Count -ne 1) {
-        throw "Expected exactly one Version element in $ProjectPath; found $($versionNodes.Count)."
+        throw "Expected exactly one Cargo package version in $ProjectPath; found $($versionNodes.Count)."
     }
 
-    $projectVersion = ([string] $versionNodes[0].InnerText).Trim()
+    $projectVersion = $versionNodes[0].Groups[1].Value
     if ($projectVersion -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
         throw "Project Version must use Major.Minor.Patch numeric format; found '$projectVersion' in $ProjectPath."
     }
 
     return $projectVersion
-}
-
-function Invoke-DotNet {
-    & dotnet @args
-    $exitCode = $LASTEXITCODE
-    if ($exitCode -ne 0) {
-        throw "dotnet $($args -join ' ') failed with exit code $exitCode."
-    }
 }
 
 function Get-NonEmptyFile {
@@ -66,36 +57,24 @@ function Get-ChecksumLines {
     }
 }
 
-function Assert-SingleFilePublishedArtifacts {
-    param(
-        [string] $PublishDirectory,
-        [string] $ExpectedExeName
-    )
-    $publishedFiles = Get-ChildItem -LiteralPath $PublishDirectory -File
-
-    if ([string]::IsNullOrWhiteSpace($ExpectedExeName)) {
-        throw 'Expected single-file executable name cannot be empty.'
+function Assert-NativeX64Executable {
+    param([string] $Path)
+    [void](Get-NonEmptyFile $Path 'Native executable')
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -lt 64 -or [BitConverter]::ToUInt16($bytes, 0) -ne 0x5A4D) {
+        throw "Invalid executable DOS header: $Path"
     }
-
-    if (-not ($publishedFiles | Where-Object { $_.Name -ieq $ExpectedExeName })) {
-        throw "Single-file publish output must include $ExpectedExeName in $PublishDirectory."
+    $peOffset = [long][BitConverter]::ToUInt32($bytes, 60)
+    if ($peOffset + 264 -gt $bytes.Length -or [BitConverter]::ToUInt32($bytes, $peOffset) -ne 0x4550) {
+        throw "Invalid executable PE header: $Path"
     }
-
-    $unexpectedArtifacts = @(
-        foreach ($file in $publishedFiles) {
-            if ($file.Name -ieq $ExpectedExeName) {
-                continue
-            }
-            if ($file.Extension -ieq '.pdb') {
-                continue
-            }
-            $file
-        }
-    )
-
-    if ($unexpectedArtifacts.Count -ne 0) {
-        $names = @($unexpectedArtifacts | ForEach-Object { $_.Name }) -join ', '
-        throw "Publish produced sidecar artifacts for a single-file release: $names"
+    if ([BitConverter]::ToUInt16($bytes, $peOffset + 4) -ne 0x8664 -or
+        [BitConverter]::ToUInt16($bytes, $peOffset + 24) -ne 0x20B) {
+        throw "Portable executable must be Windows x64 PE32+: $Path"
+    }
+    # PE32+ data directory 14 is the CLR runtime header. Native Rust must leave it empty.
+    if ([BitConverter]::ToUInt64($bytes, $peOffset + 24 + 112 + 14 * 8) -ne 0) {
+        throw "Portable executable unexpectedly contains a CLR runtime header: $Path"
     }
 }
 
@@ -125,12 +104,15 @@ function Assert-StagedRelease {
         [string] $StagedExe,
         [string] $StagedZip,
         [string] $StagedChecksum,
-        [string] $ValidationDirectory
+        [string] $ValidationDirectory,
+        [string] $StagedInstaller
     )
 
     [void](Get-NonEmptyFile $StagedExe 'Staged release exe')
     [void](Get-NonEmptyFile $StagedZip 'Staged release zip')
-    Assert-ChecksumFile -ChecksumPath $StagedChecksum -ArtifactPaths @($StagedExe, $StagedZip)
+    [void](Get-NonEmptyFile $StagedInstaller 'Staged NSIS installer')
+    Assert-NativeX64Executable $StagedExe
+    Assert-ChecksumFile -ChecksumPath $StagedChecksum -ArtifactPaths @($StagedExe, $StagedZip, $StagedInstaller)
 
     New-Item -ItemType Directory -Path $ValidationDirectory -Force | Out-Null
     try {
@@ -145,7 +127,9 @@ function Assert-StagedRelease {
         $expandedExe,
         (Join-Path $ValidationDirectory 'README.md'),
         (Join-Path $ValidationDirectory 'LICENSE'),
-        (Join-Path $ValidationDirectory 'keyboard-debounce.ico')
+        (Join-Path $ValidationDirectory 'keyboard-debounce.ico'),
+        (Join-Path $ValidationDirectory 'docs\DESIGN.md'),
+        (Join-Path $ValidationDirectory 'docs\TAURI-VALIDATION.md')
     )) {
         [void](Get-NonEmptyFile $requiredPath 'Required staged ZIP entry')
     }
@@ -372,126 +356,65 @@ function Commit-ReleaseArtifacts {
 }
 
 function Invoke-Publish {
+    . (Join-Path $PSScriptRoot 'toolchain.ps1')
+    Initialize-Toolchain
     $version = Get-ProjectVersion $project
     $releaseBase = "KeyboardDebounce-$version-$runtime"
-    $releaseExe = Join-Path $releaseDir "$releaseBase.exe"
-    $releaseZip = Join-Path $releaseDir "$releaseBase.zip"
-    $releaseChecksum = Join-Path $releaseDir "$releaseBase.sha256"
-    $stageRoot = Join-Path $stagingParent ('{0}-{1}-{2}' -f $releaseBase, $PID, [Guid]::NewGuid().ToString('N'))
-    $publishDir = Join-Path $stageRoot 'publish'
+    $stageRoot = Join-Path $stagingParent ([Guid]::NewGuid().ToString('N'))
     $packageRoot = Join-Path $stageRoot 'package'
     $artifactDirectory = Join-Path $stageRoot 'artifacts'
     $validationDirectory = Join-Path $stageRoot 'validation'
+    New-Item -ItemType Directory -Force -Path $packageRoot, $artifactDirectory, $releaseDir | Out-Null
     $stagedExe = Join-Path $artifactDirectory "$releaseBase.exe"
     $stagedZip = Join-Path $artifactDirectory "$releaseBase.zip"
+    $stagedInstaller = Join-Path $artifactDirectory "$releaseBase-setup.exe"
     $stagedChecksum = Join-Path $artifactDirectory "$releaseBase.sha256"
-
-    $environmentVariableNames = @(
-        'DOTNET_CLI_HOME',
-        'NUGET_PACKAGES',
-        'NUGET_HTTP_CACHE_PATH',
-        'APPDATA',
-        'LOCALAPPDATA',
-        'DOTNET_SKIP_FIRST_TIME_EXPERIENCE',
-        'DOTNET_CLI_TELEMETRY_OPTOUT'
-    )
-    $originalEnvironment = @{}
-    foreach ($name in $environmentVariableNames) {
-        $originalEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
-    }
-
+    $lockPath = Join-Path $releaseDir '.publish.lock'
+    $publishLock = $null
+    Push-Location $root
     try {
-        New-Item -ItemType Directory -Path $publishDir, $packageRoot, $artifactDirectory -Force | Out-Null
-
-        $env:DOTNET_CLI_HOME = Join-Path $dist 'dotnet-home'
-        $env:NUGET_PACKAGES = Join-Path $dist 'nuget-packages'
-        $env:NUGET_HTTP_CACHE_PATH = Join-Path $dist 'nuget-http-cache'
-        $env:APPDATA = Join-Path $dist 'appdata'
-        $env:LOCALAPPDATA = Join-Path $dist 'localappdata'
-        $env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE = '1'
-        $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
-
-        Invoke-DotNet restore $project --configfile $nugetConfig
-        Invoke-DotNet restore $testProject --configfile $nugetConfig
-        Invoke-DotNet build $project -c Release --no-restore
-        Invoke-DotNet test $testProject -c Release --no-restore
-        Invoke-DotNet publish $project -c Release -r $runtime --self-contained true `
-            '-p:SelfContained=true' `
-            '-p:WindowsPackageType=None' `
-            '-p:WindowsAppSDKSelfContained=true' `
-            '-p:EnableMsixTooling=true' `
-            '-p:PublishSingleFile=true' `
-            '-p:IncludeAllContentForSelfExtract=true' `
-            '-p:IncludeNativeLibrariesForSelfExtract=true' `
-            "-p:AssemblyName=$releaseBase" `
-            -o $publishDir
-        $publishedExeName = "$releaseBase.exe"
-        Assert-SingleFilePublishedArtifacts `
-            -PublishDirectory $publishDir `
-            -ExpectedExeName $publishedExeName
-
-        $publishedExe = Join-Path $publishDir $publishedExeName
-        $publishedExeItem = Get-NonEmptyFile $publishedExe 'Published exe'
-        $publishedVersionInfo = $publishedExeItem.VersionInfo
-        if ([string]::IsNullOrWhiteSpace($publishedVersionInfo.FileVersion)) {
-            throw "Published exe has no FileVersion: $publishedExe"
-        }
-
-        $actualFileVersion = '{0}.{1}.{2}.{3}' -f `
-            $publishedVersionInfo.FileMajorPart, `
-            $publishedVersionInfo.FileMinorPart, `
-            $publishedVersionInfo.FileBuildPart, `
-            $publishedVersionInfo.FilePrivatePart
-        $expectedFileVersion = ([Version] "$version.0").ToString(4)
-        if ($actualFileVersion -ne $expectedFileVersion) {
-            throw "Published exe FileVersion '$actualFileVersion' does not match project Version '$version' (expected '$expectedFileVersion'): $publishedExe"
-        }
-
+        $publishLock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        & (Join-Path $PSScriptRoot 'verify.ps1')
+        if (-not $?) { throw 'Verification failed' }
+        Invoke-Checked 'npm.cmd' @('run', 'tauri', '--', 'build', '--target', 'x86_64-pc-windows-msvc')
+        $targetRoot = Join-Path $root 'src-tauri\target\x86_64-pc-windows-msvc\release'
+        $publishedExe = Join-Path $targetRoot 'keyboard-debounce.exe'
+        $exe = Get-NonEmptyFile $publishedExe 'Portable executable'
+        $info = $exe.VersionInfo
+        $actual = '{0}.{1}.{2}' -f $info.FileMajorPart, $info.FileMinorPart, $info.FileBuildPart
+        if ($actual -ne $version) { throw "Executable version $actual does not match Cargo version $version" }
+        $installerDirectory = Join-Path $targetRoot 'bundle\nsis'
+        $installers = @(Get-ChildItem -LiteralPath $installerDirectory -Filter "*${version}*x64*setup.exe")
+        if ($installers.Count -ne 1) { throw "Expected one NSIS installer in $installerDirectory; found $($installers.Count)" }
         Copy-Item -LiteralPath $publishedExe -Destination $stagedExe
+        Copy-Item -LiteralPath $installers[0].FullName -Destination $stagedInstaller
         Copy-Item -LiteralPath $stagedExe -Destination (Join-Path $packageRoot "$releaseBase.exe")
-        Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination (Join-Path $packageRoot 'README.md')
-        Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $packageRoot 'LICENSE')
+        foreach ($name in @('README.md', 'LICENSE')) {
+            Copy-Item -LiteralPath (Join-Path $root $name) -Destination (Join-Path $packageRoot $name)
+        }
+        $packageDocs = Join-Path $packageRoot 'docs'
+        New-Item -ItemType Directory -Path $packageDocs | Out-Null
+        foreach ($name in @('DESIGN.md', 'TAURI-VALIDATION.md')) {
+            Copy-Item -LiteralPath (Join-Path (Join-Path $root 'docs') $name) -Destination (Join-Path $packageDocs $name)
+        }
         Copy-Item -LiteralPath (Join-Path $root 'assets\keyboard-debounce.ico') -Destination (Join-Path $packageRoot 'keyboard-debounce.ico')
         Compress-Archive -Path (Join-Path $packageRoot '*') -DestinationPath $stagedZip
-
-        $checksumLines = @(Get-ChecksumLines -ArtifactPaths @($stagedExe, $stagedZip))
-        $checksumLines | Set-Content -LiteralPath $stagedChecksum -Encoding Ascii
-        Assert-StagedRelease `
-            -StagedExe $stagedExe `
-            -StagedZip $stagedZip `
-            -StagedChecksum $stagedChecksum `
-            -ValidationDirectory $validationDirectory
-
-        New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
-        $releaseMappings = @(
-            [pscustomobject]@{ StagedPath = $stagedExe; TargetPath = $releaseExe },
-            [pscustomobject]@{ StagedPath = $stagedZip; TargetPath = $releaseZip },
-            [pscustomobject]@{ StagedPath = $stagedChecksum; TargetPath = $releaseChecksum }
-        )
-        Assert-ReleaseTargetsReplaceable -Mappings $releaseMappings -ReleaseDirectory $releaseDir
-        Commit-ReleaseArtifacts -Mappings $releaseMappings
-
-        Write-Host "Verified FileVersion: $actualFileVersion"
-        Write-Host "Release exe: $releaseExe"
-        Write-Host "Release zip: $releaseZip"
-        Write-Host "SHA256 checksums: $releaseChecksum"
+        Get-ChecksumLines @($stagedExe, $stagedZip, $stagedInstaller) | Set-Content -LiteralPath $stagedChecksum -Encoding ascii
+        Assert-StagedRelease -StagedExe $stagedExe -StagedZip $stagedZip -StagedChecksum $stagedChecksum -StagedInstaller $stagedInstaller -ValidationDirectory $validationDirectory
+        $mappings = @($stagedExe, $stagedZip, $stagedInstaller, $stagedChecksum) | ForEach-Object {
+            [pscustomobject]@{ StagedPath = $_; TargetPath = Join-Path $releaseDir (Split-Path -Leaf $_) }
+        }
+        Assert-ReleaseTargetsReplaceable -Mappings $mappings -ReleaseDirectory $releaseDir
+        Commit-ReleaseArtifacts -Mappings $mappings
+        Write-Host "输入：$stageRoot；输出：$releaseDir；处理 4，跳过 0，失败 0。"
+    }
+    catch {
+        Write-Error "发布失败。输入：$stageRoot；输出：$releaseDir；失败原因：$($_.Exception.Message)" -ErrorAction Continue
+        throw
     }
     finally {
-        foreach ($name in $environmentVariableNames) {
-            [Environment]::SetEnvironmentVariable($name, $originalEnvironment[$name], 'Process')
-        }
-
-        if (Test-Path -LiteralPath $stageRoot) {
-            try {
-                Microsoft.PowerShell.Management\Remove-Item -LiteralPath $stageRoot -Recurse -Force
-            }
-            catch {
-                Write-Warning "Could not remove release staging directory: $stageRoot. $($_.Exception.Message)"
-            }
-        }
+        if ($null -ne $publishLock) { $publishLock.Dispose() }
+        Pop-Location
     }
 }
-
-if (-not $FunctionsOnly) {
-    Invoke-Publish
-}
+if (-not $FunctionsOnly) { Invoke-Publish }
