@@ -2,7 +2,7 @@
 
 日期：2026-09-05。当前为待实机验收的本地构建，尚未完成计划中的最终验收。用户要求先完成后台工作，稍后继续窗口测试。
 
-紧凑版候选产物已归并至 `releases/`，含便携 EXE、ZIP、安装包和 SHA256，均已校验。此前常规发布目录中的 EXE 被运行实例占用，发布预检按设计报错并保留旧文件；占用解除后完成四文件事务替换，并按用户要求清理旧版 EXE、配套 ZIP/校验文件及重复发布副本。保留最新编译输出和旧 C# 源码；本轮没有启动应用或操作窗口，实机验收仍待完成。
+紧凑版候选产物已归并至 `releases/`，含便携 EXE、ZIP、安装包和 SHA256，均已校验。此前常规发布目录中的 EXE 被运行实例占用，发布预检按设计报错并保留旧文件；占用解除后完成四文件事务替换，并按用户要求清理旧版 EXE、配套 ZIP/校验文件及重复发布副本。保留最新编译输出；随后按用户要求移除旧 C# 源码和旧测试。本轮没有启动应用或操作窗口，实机验收仍待完成。
 
 ## 已完成
 
@@ -15,7 +15,7 @@
 | 静态检查 | Rust 格式、Clippy `-D warnings`、TypeScript 检查和 Vite 构建通过 |
 | 发布事务 | 四文件替换、文件占用、准备失败、提交中途失败回滚、校验文件篡改检测通过 |
 | 产物 | x64 便携 EXE、ZIP、NSIS 当前用户安装包及 SHA256；检查 EXE 版本、PE x64/无 CLR 头、ZIP 内 EXE 与独立 EXE 一致 |
-| 构建独立性 | 新验证与发布入口、Windows CI 均使用 Rust/npm，不调用 .NET；旧代码仅保留作验收对照 |
+| 构建独立性 | 验证与发布入口、Windows CI 均使用 Rust/npm，不调用 .NET；旧工程和旧测试已删除，行为基准独立保留 |
 | 数据隔离 | 开发窗口使用仓库 `artifacts/tauri-smoke-appdata/KeyboardDebounceTauri`；未导入或修改旧用户配置 |
 
 复现入口：`scripts/verify.ps1`。完整构建和产物校验：`scripts/publish.ps1`。Windows CI 调用发布入口并上传四种产物。原 C# 基准来源见 `src-tauri/tests/fixtures/README.md`。
@@ -33,8 +33,10 @@
 | 安装与卸载 | 当前用户安装、运行、卸载；安装包缺少 WebView2 时补齐；便携版缺失 WebView2 时原生提示 |
 | 故障与退出 | 原生故障提示、自启注册表实际失败、退出最终保存失败；不能显示成功或错误地声称防抖正常 |
 
-## 旧工程移除条件
+## 仓库清理
 
 紧凑版只修改 React 组件、样式、前端测试和文档，Rust、DTO、IPC 和防抖逻辑保持不变。新版布局尚未进行真实截图、DPI 或可见行数实测；旧 WinUI 截图不作为新布局通过的证据。
 
-以上实机验收通过后，再移除 `KeyboardDebounce.csproj`、`NuGet.Config`、旧 `src` 和 `tests/KeyboardDebounce.Tests` 中的已跟踪源码，并再次运行统一验证及发布。`design-qa.md` 和现有素材保留。当前未将未验证项标为通过，也未提前删除旧工程。
+用户随后明确要求清理遗留文件，已移除 `KeyboardDebounce.csproj`、`NuGet.Config`、旧 `src` 和 `tests/KeyboardDebounce.Tests` 中的已跟踪源码。新版 Rust、前端和发布契约测试继续留在仓库，安装包与便携 ZIP 不包含测试源码或基准 JSON。`design-qa.md` 和现有素材保留。旧代码可从 Git 历史查阅；源码清理不代表上述实机验收通过。
+
+删除后再次执行 `scripts/verify.ps1` 全部通过，覆盖 Rust 格式、Clippy、35 个 Rust 测试（含行为基准）、TypeScript、21 个前端测试、Vite 构建及发布契约。核对现有便携 ZIP，仅含 EXE、README、LICENSE、图标和两份文档；安装配置没有附带测试资源。本轮未重新生成安装包或进行实机验收。

@@ -2,9 +2,12 @@
 * text=auto
 
 # Keep source and docs as LF in repo
-*.cs text eol=lf
-*.csproj text eol=lf
-*.sln text eol=crlf
+*.rs text eol=lf
+*.toml text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.css text eol=lf
+*.html text eol=lf
 *.md text eol=lf
 *.json text eol=lf
 *.yml text eol=lf

@@ -4,7 +4,7 @@
 
 Windows 用户态键盘防抖托盘程序，用于缓解键盘单击重复触发。采用 **Tauri 2 + React + TypeScript + Rust + Windows API**，不使用键盘驱动。
 
-0.3.0 当前为待实机验收构建。自动回归和本地打包已完成；窗口生命周期、物理键盘及安装/卸载的剩余检查见 [验证记录](docs/TAURI-VALIDATION.md)。旧 C# 工程在验收通过后移除。
+0.3.0 当前为待实机验收构建。自动回归和本地打包已完成；窗口生命周期、物理键盘及安装/卸载的剩余检查见 [验证记录](docs/TAURI-VALIDATION.md)。旧 C# 工程和旧测试已移除，历史实现可从 Git 历史查阅。
 
 ## 下载与运行
 
@@ -75,6 +75,8 @@ npm.cmd run tauri -- dev
 PowerShell 中使用 `npm.cmd` 向 Tauri 转发参数。脚本会检查 `%USERPROFILE%\.cargo\bin`，无需手动修改全局 PATH。
 
 `verify.ps1` 运行 Rust 格式检查、Clippy、Rust 测试、生成的 TypeScript 类型检查、前端交互测试、前端构建及发布事务测试。Rust 回归包含原 C# 引擎生成的 5,400 条合成事件，逐项比对拦截决策与学习统计；不会采集真实用户的输入序列。
+
+新版测试和合成基准保留在源码仓库供 CI 回归使用，不随安装包或便携 ZIP 分发。
 
 `publish.ps1` 先验证并构建，再在 `dist\release-staging` 校验 EXE、ZIP、安装包及哈希，最后以可回滚事务更新 `releases`。文件占用时保留原产物，不结束占用进程。版本仅取自 `src-tauri/Cargo.toml`。发布二进制不提交到仓库。
 
